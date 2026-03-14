@@ -1,0 +1,12 @@
+.env
+Neo4j-*.txt
+*.dump
+!test.dump
+*.backup
+__pycache__/
+export/
+multi-db.sh
+faq.md
+neo4j/
+.DS_Store
+.claude
