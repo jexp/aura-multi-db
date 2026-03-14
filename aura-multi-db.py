@@ -10,6 +10,7 @@ import json
 import os
 import re
 import secrets
+import stat
 import string
 import sys
 import time
@@ -95,6 +96,14 @@ def load_env(env_path: Path) -> dict:
         key, val = line.split("=", 1)
         env[key.strip()] = val.strip().strip("\"'")
     return env
+
+
+def _write_credential_file(filepath: Path, content: str) -> None:
+    """Write a credential file with restricted permissions (owner-only)."""
+    fd = os.open(filepath, os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                 stat.S_IRUSR | stat.S_IWUSR)  # 0600
+    with os.fdopen(fd, "w") as f:
+        f.write(content)
 
 
 def require_env(env: dict, *keys: str) -> None:
@@ -684,7 +693,7 @@ def cmd_create_instance(env: dict):
     print(f"Name:         {data['name']}")
     print(f"Connection:   {data['connection_url']}")
     print(f"Username:     {data['username']}")
-    print(f"Password:     {data['password']}")
+    print(f"Password:     (saved to credentials file)")
     print(f"Tenant:       {data['tenant_id']}")
 
     # Extract default database ID from connection URL
@@ -695,7 +704,7 @@ def cmd_create_instance(env: dict):
     script_dir = Path(__file__).parent
     filename = f"Neo4j-{data['id']}-Created-{time.strftime('%Y-%m-%d')}.txt"
     filepath = script_dir / filename
-    filepath.write_text(
+    _write_credential_file(filepath,
         f"# Wait 60 seconds before connecting using these details, "
         f"or login to https://console.neo4j.io to validate the Aura Instance is available\n"
         f"NEO4J_URI={connection_url}\n"
@@ -838,7 +847,7 @@ def _add_users(env: dict, database_id: str, database_name: str = None) -> None:
         name_part = f"-{database_name}" if database_name != database_id else ""
         filename = f"Neo4j-{instance_id}-{database_id}{name_part}-{role_label}.txt"
         filepath = script_dir / filename
-        filepath.write_text(
+        _write_credential_file(filepath,
             f"# Neo4j Aura — {role_label} credentials for database {database_id}\n"
             f"# Instance: {instance_id} ({instance_name})\n"
             f"NEO4J_URI={bolt_uri}\n"
