@@ -391,17 +391,34 @@ class QueryAPI:
         self.base_url = "https://" + bolt_uri.replace("neo4j+s://", "")
         self.auth_header = _basic_auth_header(username, password)
 
-    def run(self, database: str, statement: str) -> dict:
-        """Execute a single Cypher statement and return the response data."""
+    def run(self, database: str, statement: str, _retries: int = 4) -> dict:
+        """Execute a single Cypher statement and return the response data.
+
+        Retries with exponential backoff on transient 'no longer accepts writes'
+        errors that can occur when many jobs hit the system DB concurrently.
+        """
         url = f"{self.base_url}/db/{database}/query/v2"
-        result = _json_request(url, method="POST",
-                               headers={"Authorization": self.auth_header},
-                               body={"statement": statement})
-        if result.get("errors"):
-            msgs = [f"  [{e.get('code', '')}] {e.get('message', '')}"
-                    for e in result["errors"]]
+        for attempt in range(_retries + 1):
+            result = _json_request(url, method="POST",
+                                   headers={"Authorization": self.auth_header},
+                                   body={"statement": statement})
+            errors = result.get("errors", [])
+            if not errors:
+                return result.get("data", {})
+            transient = [e for e in errors
+                         if "no longer accepts writes" in e.get("message", "")
+                         or "Unavailable" in e.get("code", "")
+                         or "TransientError" in e.get("code", "")]
+            if transient and attempt < _retries:
+                wait = 2 ** attempt
+                print(f"  [retry {attempt + 1}/{_retries}] transient system-DB error, "
+                      f"retrying in {wait}s...")
+                time.sleep(wait)
+                continue
+            msgs = [f"  [{e.get('code', 'N/A')}] {e.get('message', '')}"
+                    for e in errors]
             die("Cypher error:\n" + "\n".join(msgs))
-        return result.get("data", {})
+        return {}  # unreachable
 
     def run_many(self, database: str, statements: list) -> None:
         """Execute multiple Cypher statements sequentially."""
@@ -594,28 +611,34 @@ def _gcp_query_position(upload_url: str, file_size: int) -> int:
         die(f"Failed to get resume position (HTTP {e.code})")
 
 
+# GCP resumable-upload chunk size (must be a multiple of 256 KiB per GCP spec).
+# Default 1 GiB — large enough to minimise round-trips, safely under the 2 GiB
+# SSL send limit on 32-bit Python SSL stacks. Override with GCP_CHUNK_SIZE_MB.
+_GCP_CHUNK_SIZE = int(os.environ.get("GCP_CHUNK_SIZE_MB", "1024")) * 1024 * 1024
+# Clamp to a multiple of 256 KiB and cap at 1.9 GiB to stay under the SSL limit
+_GCP_CHUNK_SIZE = min((_GCP_CHUNK_SIZE // (256 * 1024)) * (256 * 1024), 1900 * 1024 * 1024)
+
+
 def _gcp_send_chunk(upload_url: str, file_path: Path,
                     file_size: int, position: int) -> bool:
-    """Upload file data from the given position. Returns True if complete."""
-    remaining = file_size - position
-    headers = {"Content-Length": str(remaining)}
-    if position > 0:
-        headers["Content-Range"] = f"bytes {position}-{file_size - 1}/{file_size}"
+    """Upload one chunk from the given byte position. Returns True if the upload is complete."""
+    end = min(position + _GCP_CHUNK_SIZE, file_size) - 1  # inclusive
+    chunk_len = end - position + 1
 
     with open(file_path, "rb") as f:
         f.seek(position)
-        data = f.read()
+        data = f.read(chunk_len)
 
     req = urllib.request.Request(upload_url, data=data, method="PUT")
-    for key, value in headers.items():
-        req.add_header(key, value)
+    req.add_header("Content-Length", str(chunk_len))
+    req.add_header("Content-Range", f"bytes {position}-{end}/{file_size}")
 
     try:
         with urllib.request.urlopen(req):
-            return True
+            return True  # 200/201 — upload complete
     except urllib.error.HTTPError as e:
         if e.code == 308:
-            return False  # incomplete, caller will query position
+            return False  # incomplete — caller will query the committed position
         raise
 
 
@@ -632,15 +655,17 @@ def _gcp_resumable_upload(signed_uri: str, file_path: Path, file_size: int) -> N
             if _gcp_send_chunk(upload_url, file_path, file_size, position):
                 if _is_interactive():
                     print(f"\r\033[K", end="")
-                print(f"  Upload complete ({file_size} bytes).")
+                print(f"  Upload complete ({file_size:,} bytes).")
                 return
-            # 308 incomplete — query actual position
+            # 308 Resume Incomplete — ask GCP how many bytes it actually committed
             position = _gcp_query_position(upload_url, file_size)
             percent = (position / file_size) * 100
+            mb_done = position / (1024 * 1024)
+            mb_total = file_size / (1024 * 1024)
             if _is_interactive():
-                print(f"\r\033[K  Upload: {percent:.1f}% ({position}/{file_size})", end="", flush=True)
+                print(f"\r\033[K  Upload: {percent:.1f}%  ({mb_done:.0f} / {mb_total:.0f} MB)", end="", flush=True)
             else:
-                print(f"  Upload: {percent:.1f}% ({position}/{file_size})")
+                print(f"  Upload: {percent:.1f}%  ({mb_done:.0f} / {mb_total:.0f} MB)")
             retry_count = 0
 
         except urllib.error.HTTPError as e:
@@ -827,29 +852,48 @@ def cmd_list_dbs(env: dict):
         print("  ".join(parts))
 
 
+def _creds_dir() -> Path:
+    """Return the directory where credential files are written.
+
+    Priority: NEO4J_CREDS_DIR > NEO4J_DATABASES_DIR/users > ./databases/users
+    """
+    d = os.environ.get("NEO4J_CREDS_DIR")
+    if not d:
+        db_dir = os.environ.get("NEO4J_DATABASES_DIR", "databases")
+        d = str(Path(db_dir) / "users")
+    p = Path(d)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
 def _write_user_cred_file(env: dict, database_id: str, database_name: str,
                           username: str, password: str, role_label: str,
-                          extra_db_ids: list = None, roles: list = None) -> Path:
+                          db_pairs: list = None, roles: list = None) -> Path:
     """Write a credential file for one user and return its path.
 
     Filename: Neo4j-{instance_id}-{database_id}-{username}-{role_label}.txt
-    extra_db_ids lists additional databases this user can access (multi-db case).
-    roles lists the Neo4j role names granted to this user (for reference).
+    Output directory: NEO4J_CREDS_DIR env var, or the script directory.
+    db_pairs  — list of (db_id, db_name) for every database this user can access.
+    roles     — Neo4j role names granted to this user (for reference).
     """
     instance_id = env.get("AURA_INSTANCEID", "unknown")
     instance_name = env.get("AURA_INSTANCENAME", "")
     bolt_uri = env["NEO4J_URI"]
     filename = f"Neo4j-{instance_id}-{database_id}-{username}-{role_label}.txt"
-    filepath = Path(__file__).parent / filename
-    extra_comment = ""
-    if extra_db_ids:
-        extra_comment += f"# Additional databases: {', '.join(extra_db_ids)}\n"
-    if roles:
-        extra_comment += f"# Roles: {', '.join(roles)}\n"
+    filepath = _creds_dir() / filename
+
+    # Build the database list comment
+    all_pairs = db_pairs or [(database_id, database_name)]
+    db_lines = "".join(f"#   {did}  {dname}\n" for did, dname in all_pairs)
+    roles_line = f"# Roles: {', '.join(roles)}\n" if roles else ""
+
     _write_credential_file(filepath,
-        f"# Neo4j Aura — {role_label} credentials for {username} on database {database_id}\n"
+        f"# Neo4j Aura — {role_label} credentials for {username}\n"
         f"# Instance: {instance_id} ({instance_name})\n"
-        f"{extra_comment}"
+        f"#\n"
+        f"# Databases:\n"
+        f"{db_lines}"
+        f"{roles_line}"
         f"NEO4J_URI={bolt_uri}\n"
         f"NEO4J_USERNAME={username}\n"
         f"NEO4J_PASSWORD={password}\n"
@@ -912,13 +956,14 @@ def _add_users(env: dict, database_id: str, database_name: str = None, prefix: s
     query.run_and_print("system", "SHOW USERS")
 
     print(f"\n=== Users Created ===")
-    for user, password, label, role in [
-        (ro_user, ro_pass, "readonly",  ro_role),
-        (rw_user, rw_pass, "readwrite", f"{ro_role}, {rw_role}"),
+    single_pair = [(database_id, database_name)]
+    for user, password, label, uroles in [
+        (ro_user, ro_pass, "readonly",  [ro_role]),
+        (rw_user, rw_pass, "readwrite", [ro_role, rw_role]),
     ]:
         filepath = _write_user_cred_file(env, database_id, database_name, user, password, label,
-                                         roles=[ro_role] if label == "readonly" else [ro_role, rw_role])
-        print(f"  {label}: {user}  roles=[{role}] -> {filepath.name}")
+                                         db_pairs=single_pair, roles=uroles)
+        print(f"  {label}: {user}  roles=[{', '.join(uroles)}] -> {filepath.name}")
 
 
 def cmd_add_users(env: dict):
@@ -993,7 +1038,6 @@ def cmd_add_users(env: dict):
                 f"GRANT WRITE ON GRAPH `{db_id}` TO `{db_id}_rw`",
             ])
 
-    extra_db_ids = db_ids[1:] if is_multi else None
     home_clause = f" SET HOME DATABASE `{first_db_id}`" if is_multi else ""
 
     def _user_exists(name: str) -> bool:
@@ -1010,8 +1054,8 @@ def cmd_add_users(env: dict):
                 f"CREATE USER `{user_name}` SET PASSWORD '{password}'"
                 f" CHANGE NOT REQUIRED{home_clause}")
             filepath = _write_user_cred_file(env, first_db_id, first_db_name, user_name,
-                                             password, role_label, extra_db_ids=extra_db_ids,
-                                             roles=roles)
+                                             password, role_label,
+                                             db_pairs=db_pairs, roles=roles)
             print(f"  {user_name} (new) roles=[{roles_str}] -> {filepath.name}")
         else:
             print(f"  {user_name} (existing) roles added: {roles_str}")

@@ -102,6 +102,9 @@ Variables are loaded with increasing priority: **shell env < .env < --creds file
 | `NEO4J_URI` | Instance bolt URI (`neo4j+s://...`) |
 | `NEO4J_USERNAME`, `NEO4J_PASSWORD` | Admin credentials |
 | `AURA_INSTANCEID` | Instance ID |
+| `NEO4J_DATABASES_DIR` | Folder containing dump files (default: `databases`); credential files go to `<dir>/users/` |
+| `NEO4J_CREDS_DIR` | Override credential file output dir directly (takes priority over `NEO4J_DATABASES_DIR`) |
+| `GCP_CHUNK_SIZE_MB` | GCP upload chunk size in MB (default: 1024) |
 
 ## Examples
 
@@ -117,7 +120,11 @@ python3 aura-multi-db.py add-users c7511697 analytics --users alice,bob --ro
 python3 aura-multi-db.py add-users c7511697 c360_data --users michael,jane
 
 # Grant michael read-only access to two databases (single user account, home db = first)
+# Creates michael_ro with roles c7511697_ro and b9f63f7b_ro; home database = c7511697
 python3 aura-multi-db.py add-users c7511697,b9f63f7b c360_data,analytics --users michael --ro
+
+# Grant a team member ro+rw access across three databases
+python3 aura-multi-db.py add-users c7511697,b9f63f7b,0bf4a21f c360,analytics,reporting --users alice
 
 # Quick async create (returns immediately)
 python3 aura-multi-db.py add-db reporting
@@ -132,6 +139,48 @@ python3 aura-multi-db.py upload abc123 data.dump
 python3 aura-multi-db.py delete-db abc123 --wait --yes
 ```
 
+## Bulk deployment
+
+`deploy-databases.sh` scans a folder for `*.backup` / `*.dump` files, creates or re-uploads each database in parallel, then assigns named users across all of them.
+
+```bash
+./deploy-databases.sh <folder> <home-db-slug> <rw-users> <ro-users>
+```
+
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `folder` | Directory containing dump/backup files | `./databases` |
+| `home-db-slug` | Slug of the database set as home DB for all named users | `c360` |
+| `rw-users` | Comma-separated usernames to receive ro+rw access | _(none)_ |
+| `ro-users` | Comma-separated usernames to receive ro-only access | _(none)_ |
+
+```bash
+# Deploy all dumps in ./databases, home db = mydb, with rw and ro user sets
+./deploy-databases.sh ./databases mydb \
+    "alice,bob" \
+    "charlie,dana"
+```
+
+- Per-database logs are written to `<folder>/outputs/<slug>.log`
+- Credential files go to `<folder>/users/`
+- Databases are created/uploaded in parallel; user assignment runs after all uploads complete
+- If some uploads fail, user assignment still runs for the successful ones
+- Safe to re-run: existing databases are re-uploaded rather than re-created; existing users get new role grants without a password change
+
+### Adding users to an existing deployment
+
+To add more users to an already-deployed set of databases, run `add-users` directly with the comma-separated list of database IDs (home DB first):
+
+```bash
+# RO only
+python3 aura-multi-db.py add-users <homeid>,<id2>,<id3>,... --users alice,bob --ro --yes
+
+# RW (ro + rw accounts)
+python3 aura-multi-db.py add-users <homeid>,<id2>,<id3>,... --users alice,bob --yes
+```
+
+Credential files are written to `./databases/users/` by default (override with `NEO4J_DATABASES_DIR` or `NEO4J_CREDS_DIR`).
+
 ## Integration test
 
 ```bash
@@ -139,10 +188,12 @@ python3 aura-multi-db.py delete-db abc123 --wait --yes
 ./test-lifecycle.sh mydata.dump  # custom dump file
 ```
 
-Runs the full lifecycle: list → add-db --users → add-users → list → upload → query as ro user → delete-db → list.
+Runs the full lifecycle: list → add-db --users → parallel user additions (ro-only, ro+rw, multi-db) → list → upload → query as ro user → delete-db → list.
+
+The three `add-users` steps (single-db ro, single-db ro+rw, multi-db across two databases) run in parallel to keep total test time down.
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.9+
 - Neo4j Aura Business Critical instance with multi-database enabled
 - Aura API key (v1beta6)
