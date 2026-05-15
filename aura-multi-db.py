@@ -114,19 +114,31 @@ def require_env(env: dict, *keys: str) -> None:
 
 
 def positional_args() -> list:
-    """Return sys.argv without flags (--wait, --yes, --users, --creds/--dump <val>)."""
+    """Return sys.argv without flags and their values.
+
+    Flags that always consume the next arg: --creds, --dump, --dbname.
+    --users consumes the next arg only if it doesn't start with '--'.
+    """
     result = []
-    skip_next = False
-    for arg in sys.argv:
-        if skip_next:
-            skip_next = False
+    i = 0
+    argv = sys.argv
+    while i < len(argv):
+        arg = argv[i]
+        if arg in ("--creds", "--dump", "--dbname"):
+            i += 2  # skip flag and its value
             continue
-        if arg in ("--creds", "--dump"):
-            skip_next = True  # skip the next arg (the value)
+        if arg == "--users":
+            # consume value only if it exists and isn't itself a flag
+            if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+                i += 2
+            else:
+                i += 1
             continue
         if arg.startswith("--"):
+            i += 1
             continue
         result.append(arg)
+        i += 1
     return result
 
 
@@ -138,6 +150,23 @@ def _parse_flag_value(flag: str) -> str:
         if arg.startswith(f"{flag}="):
             return arg.split("=", 1)[1]
     return None
+
+
+def _parse_optional_flag_value(flag: str):
+    """Return value for --flag=val or --flag val (only if val doesn't start with --), else None."""
+    for i, arg in enumerate(sys.argv):
+        if arg.startswith(f"{flag}="):
+            return arg.split("=", 1)[1]
+        if arg == flag and i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith("--"):
+            return sys.argv[i + 1]
+    return None
+
+
+def _slugify(s: str) -> str:
+    """Normalize to a safe identifier: lowercase, alphanumeric only, runs of other chars → '_'."""
+    s = s.lower()
+    s = re.sub(r'[^a-z0-9]+', '_', s)
+    return s.strip('_')
 
 
 def get_arg(index: int, usage_hint: str) -> str:
@@ -640,23 +669,29 @@ Commands:                                                          ~time
                                        → saves Neo4j-{id}-Created-{date}.txt
   add-db <dbname>                    Create a database (async)
   add-db <dbname> --wait             Create + wait until running       ~1 min
-  add-db <dbname> --users            + create ro/rw users              ~1 min
+  add-db <dbname> --users [<prefix>] + create ro/rw users              ~1 min
                                        → saves Neo4j-{inst}-{dbid}[-{name}]-{ro|rw}.txt
   add-db <dbname> --dump <file>      + upload dump/backup              ~5 min
                                        (implies --users --wait)
   list-dbs                           List databases with status
-  add-users <dbid> [dbname]          Create ro/rw users (standalone)
-                                       → saves Neo4j-{inst}-{dbid}[-{name}]-{ro|rw}.txt
+  add-users <dbid>[,<dbid2>,...]     Add named users to one or more databases
+    [dbname[,dbname2,...]]               optional slugified names (positional, matched by index)
+    --users <user1,user2,...>           comma-separated list (each slugified)
+    [--ro] [--rw]                      only that type (default: both)
+    Single DB: {user}_{slug}_ro/rw     → Neo4j-{inst}-{dbid}-{user}_{slug}-{ro|rw}.txt
+    Multi DB:  {user}_ro/rw            → home db = first dbid; access to all listed dbs
   upload <dbid> <dump-or-backup>     Upload dump/backup file           ~3 min
   delete-db <dbid>                   Delete database + users/roles     ~1 min
   remove-users <dbid>                Remove users/roles only
 
 Flags:
-  --wait           Poll until async operations complete (add-db, delete-db)
-  --yes            Skip confirmation prompts (for scripting)
-  --users          Create ro/rw users after database is running (implies --wait)
-  --dump <file>    Upload dump/backup after creating (implies --users --wait)
-  --creds <file>   Load instance credentials from file (overrides .env)
+  --wait              Poll until async operations complete (add-db, delete-db)
+  --yes               Skip confirmation prompts (for scripting)
+  --users [<prefix>]  (add-db) Create ro/rw users after running (implies --wait)
+                        prefix defaults to slugified <dbname> if omitted
+  --ro / --rw         (add-users) Create only that user type (default: both)
+  --dump <file>       Upload dump/backup after creating (implies --users --wait)
+  --creds <file>      Load instance credentials from file (overrides .env)
 
 Environment variables (shell, .env, or --creds file — last wins):
   CLIENT_ID, CLIENT_SECRET        Aura API credentials (v1beta6)
@@ -725,13 +760,14 @@ def cmd_add_db(env: dict):
     Flags escalate: --dump implies --users, --users implies --wait.
     Without flags, the API call returns immediately (async).
     """
-    database_name = get_arg(2, "add-db <dbname> [--wait] [--users] [--dump <file>]")
+    database_name = _slugify(get_arg(2, "add-db <dbname> [--wait] [--users [<prefix>]] [--dump <file>]"))
     require_env(env, "AURA_INSTANCEID")
     instance_id = env["AURA_INSTANCEID"]
 
     dump_file = _parse_flag_value("--dump")
     want_users = has_flag("--users") or dump_file
     want_wait = has_flag("--wait") or want_users
+    user_prefix = _parse_optional_flag_value("--users")
 
     print(f"Creating database '{database_name}' in instance {instance_id}... (typically ~1 min)")
 
@@ -750,7 +786,7 @@ def cmd_add_db(env: dict):
         api.wait_for_database(instance_id, database_id)
 
     if want_users:
-        _add_users(env, database_id, database_name)
+        _add_users(env, database_id, database_name, prefix=user_prefix)
 
     if dump_file:
         file_path = Path(dump_file)
@@ -791,25 +827,63 @@ def cmd_list_dbs(env: dict):
         print("  ".join(parts))
 
 
-def _add_users(env: dict, database_id: str, database_name: str = None) -> None:
-    """Create read-only and read-write roles and users for a database.
+def _write_user_cred_file(env: dict, database_id: str, database_name: str,
+                          username: str, password: str, role_label: str,
+                          extra_db_ids: list = None, roles: list = None) -> Path:
+    """Write a credential file for one user and return its path.
 
-    The ro role gets ACCESS + MATCH. The rw role only adds WRITE.
-    The rw user gets both roles, inheriting all ro permissions.
-    Writes credential files for each user.
+    Filename: Neo4j-{instance_id}-{database_id}-{username}-{role_label}.txt
+    extra_db_ids lists additional databases this user can access (multi-db case).
+    roles lists the Neo4j role names granted to this user (for reference).
+    """
+    instance_id = env.get("AURA_INSTANCEID", "unknown")
+    instance_name = env.get("AURA_INSTANCENAME", "")
+    bolt_uri = env["NEO4J_URI"]
+    filename = f"Neo4j-{instance_id}-{database_id}-{username}-{role_label}.txt"
+    filepath = Path(__file__).parent / filename
+    extra_comment = ""
+    if extra_db_ids:
+        extra_comment += f"# Additional databases: {', '.join(extra_db_ids)}\n"
+    if roles:
+        extra_comment += f"# Roles: {', '.join(roles)}\n"
+    _write_credential_file(filepath,
+        f"# Neo4j Aura — {role_label} credentials for {username} on database {database_id}\n"
+        f"# Instance: {instance_id} ({instance_name})\n"
+        f"{extra_comment}"
+        f"NEO4J_URI={bolt_uri}\n"
+        f"NEO4J_USERNAME={username}\n"
+        f"NEO4J_PASSWORD={password}\n"
+        f"NEO4J_DATABASE={database_id}\n"
+    )
+    return filepath
+
+
+def _add_users(env: dict, database_id: str, database_name: str = None, prefix: str = None) -> None:
+    """Create one ro+rw role pair and one ro+rw user pair for a database.
+
+    Roles are tied to database_id (keeps them in sync with delete-db cleanup).
+    prefix sets the user names; defaults to slugified database_name.
+    Called internally by add-db --users.
     """
     if database_name is None:
         database_name = database_id
+    db_slug = _slugify(database_name)
+    # With explicit prefix: {prefix}_{db_slug}_ro; without: {db_slug}_ro (no doubling)
+    if prefix:
+        ro_user = f"{prefix}_{db_slug}_ro"
+        rw_user = f"{prefix}_{db_slug}_rw"
+    else:
+        ro_user = f"{db_slug}_ro"
+        rw_user = f"{db_slug}_rw"
     require_env(env, "NEO4J_URI", "NEO4J_USERNAME", "NEO4J_PASSWORD")
 
-    ro_user = f"{database_id}_ro"
-    rw_user = f"{database_id}_rw"
     ro_role = f"{database_id}_ro"
     rw_role = f"{database_id}_rw"
     ro_pass = _generate_password()
     rw_pass = _generate_password()
 
     print(f"\nCreating users on {env['NEO4J_URI']} for database '{database_id}'...")
+    print(f"  Roles:      {ro_role}, {rw_role}")
     print(f"  Read-only:  {ro_user}")
     print(f"  Read-write: {rw_user}")
     confirm("")
@@ -818,18 +892,18 @@ def _add_users(env: dict, database_id: str, database_name: str = None) -> None:
 
     print(f"Creating read-only role and user {ro_user}...")
     query.run_many("system", [
-        f"CREATE ROLE `{ro_role}`",
+        f"CREATE ROLE `{ro_role}` IF NOT EXISTS",
         f"GRANT ACCESS ON DATABASE `{database_id}` TO `{ro_role}`",
         f"GRANT MATCH {{*}} ON GRAPH `{database_id}` TO `{ro_role}`",
-        f"CREATE USER `{ro_user}` SET PASSWORD '{ro_pass}' SET PASSWORD CHANGE NOT REQUIRED",
+        f"CREATE USER `{ro_user}` IF NOT EXISTS SET PASSWORD '{ro_pass}' CHANGE NOT REQUIRED",
         f"GRANT ROLE `{ro_role}` TO `{ro_user}`",
     ])
 
     print(f"Creating read-write role and user {rw_user}...")
     query.run_many("system", [
-        f"CREATE ROLE `{rw_role}`",
+        f"CREATE ROLE `{rw_role}` IF NOT EXISTS",
         f"GRANT WRITE ON GRAPH `{database_id}` TO `{rw_role}`",
-        f"CREATE USER `{rw_user}` SET PASSWORD '{rw_pass}' SET PASSWORD CHANGE NOT REQUIRED",
+        f"CREATE USER `{rw_user}` IF NOT EXISTS SET PASSWORD '{rw_pass}' CHANGE NOT REQUIRED",
         f"GRANT ROLE `{ro_role}` TO `{rw_user}`",
         f"GRANT ROLE `{rw_role}` TO `{rw_user}`",
     ])
@@ -837,35 +911,131 @@ def _add_users(env: dict, database_id: str, database_name: str = None) -> None:
     print("\nVerifying...")
     query.run_and_print("system", "SHOW USERS")
 
-    # Write credential files
-    instance_id = env.get("AURA_INSTANCEID", "unknown")
-    instance_name = env.get("AURA_INSTANCENAME", "")
-    bolt_uri = env["NEO4J_URI"]
-    script_dir = Path(__file__).parent
-
-    credentials = [(ro_user, ro_pass, "readonly"), (rw_user, rw_pass, "readwrite")]
     print(f"\n=== Users Created ===")
-    for user, password, role_label in credentials:
-        name_part = f"-{database_name}" if database_name != database_id else ""
-        filename = f"Neo4j-{instance_id}-{database_id}{name_part}-{role_label}.txt"
-        filepath = script_dir / filename
-        _write_credential_file(filepath,
-            f"# Neo4j Aura — {role_label} credentials for database {database_id}\n"
-            f"# Instance: {instance_id} ({instance_name})\n"
-            f"NEO4J_URI={bolt_uri}\n"
-            f"NEO4J_USERNAME={user}\n"
-            f"NEO4J_PASSWORD={password}\n"
-            f"NEO4J_DATABASE={database_id}\n"
-        )
-        print(f"  {role_label}: {user} -> {filepath.name}")
+    for user, password, label, role in [
+        (ro_user, ro_pass, "readonly",  ro_role),
+        (rw_user, rw_pass, "readwrite", f"{ro_role}, {rw_role}"),
+    ]:
+        filepath = _write_user_cred_file(env, database_id, database_name, user, password, label,
+                                         roles=[ro_role] if label == "readonly" else [ro_role, rw_role])
+        print(f"  {label}: {user}  roles=[{role}] -> {filepath.name}")
 
 
 def cmd_add_users(env: dict):
-    """CLI wrapper for _add_users — parses args and delegates."""
+    """Add named users to one or more databases, assigned to their ro/rw roles.
+
+    add-users <dbid>[,<dbid2>,...] [dbname[,dbname2,...]] --users <user1,user2,...> [--ro] [--rw]
+
+    Multiple db IDs are comma-separated; dbnames match by position (default: hex id).
+    Single DB: username is {user}_{db_slug}_ro/rw.
+    Multi DB:  username is {user}_ro/rw (no slug); home database set to first db.
+    Roles ({dbid}_ro / {dbid}_rw) are created idempotently for each database.
+    Each user gets their own password and credential file (keyed to the first db).
+    """
     args = positional_args()
-    database_id = get_arg(2, "add-users <dbid> [dbname]")
-    database_name = args[3] if len(args) > 3 else database_id
-    _add_users(env, database_id, database_name)
+    db_ids_raw = get_arg(2, "add-users <dbid>[,<dbid2>,...] [dbname[,...]] --users <user1,user2,...> [--ro] [--rw]")
+    db_ids = [s.strip() for s in db_ids_raw.split(",") if s.strip()]
+
+    # Optional positional dbname(s) — comma-separated, matched to db_ids by position
+    db_names_raw = args[3] if len(args) > 3 else None
+    if db_names_raw:
+        db_names = [s.strip() for s in db_names_raw.split(",") if s.strip()]
+    else:
+        db_names = []
+    db_pairs = [(db_ids[i], db_names[i] if i < len(db_names) else db_ids[i])
+                for i in range(len(db_ids))]
+
+    is_multi = len(db_ids) > 1
+    first_db_id, first_db_name = db_pairs[0]
+
+    users_raw = _parse_optional_flag_value("--users") or ""
+    usernames = [_slugify(u) for u in re.split(r"[,\s]+", users_raw) if u.strip()]
+    if not usernames:
+        die("No usernames provided — use --users alice,bob,carol")
+
+    want_ro = has_flag("--ro") or not has_flag("--rw")
+    want_rw = has_flag("--rw") or not has_flag("--ro")
+    require_env(env, "NEO4J_URI", "NEO4J_USERNAME", "NEO4J_PASSWORD")
+
+    db_label = ", ".join(db_ids) if is_multi else first_db_id
+    print(f"\nAdding users to database(s): {db_label}")
+    for db_id, db_name in db_pairs:
+        label = f"{db_id} ({db_name})" if db_name != db_id else db_id
+        roles = " / ".join(filter(None, [
+            f"{db_id}_ro" if want_ro else "",
+            f"{db_id}_rw" if want_rw else "",
+        ]))
+        print(f"  {label}: roles {roles}")
+    print("Users:")
+    for username in usernames:
+        if is_multi:
+            if want_ro: print(f"  {username}_ro  (home db: {first_db_id})")
+            if want_rw: print(f"  {username}_rw  (home db: {first_db_id})")
+        else:
+            db_slug = _slugify(first_db_name) if first_db_name != first_db_id else first_db_id
+            if want_ro: print(f"  {username}_{db_slug}_ro")
+            if want_rw: print(f"  {username}_{db_slug}_rw")
+    confirm("")
+
+    query = QueryAPI(env["NEO4J_URI"], env["NEO4J_USERNAME"], env["NEO4J_PASSWORD"])
+
+    # Create roles for every database
+    for db_id, _ in db_pairs:
+        if want_ro:
+            query.run_many("system", [
+                f"CREATE ROLE `{db_id}_ro` IF NOT EXISTS",
+                f"GRANT ACCESS ON DATABASE `{db_id}` TO `{db_id}_ro`",
+                f"GRANT MATCH {{*}} ON GRAPH `{db_id}` TO `{db_id}_ro`",
+            ])
+        if want_rw:
+            query.run_many("system", [
+                f"CREATE ROLE `{db_id}_rw` IF NOT EXISTS",
+                f"GRANT WRITE ON GRAPH `{db_id}` TO `{db_id}_rw`",
+            ])
+
+    extra_db_ids = db_ids[1:] if is_multi else None
+    home_clause = f" SET HOME DATABASE `{first_db_id}`" if is_multi else ""
+
+    def _user_exists(name: str) -> bool:
+        data = query.run("system", f"SHOW USERS YIELD user WHERE user = '{name}'")
+        return bool(data.get("values"))
+
+    def _create_or_grant(user_name: str, role_label: str, roles: list, grant_stmts: list) -> None:
+        """Create user if new (saving creds), then always grant roles."""
+        exists = _user_exists(user_name)
+        roles_str = ", ".join(roles)
+        if not exists:
+            password = _generate_password()
+            query.run("system",
+                f"CREATE USER `{user_name}` SET PASSWORD '{password}'"
+                f" CHANGE NOT REQUIRED{home_clause}")
+            filepath = _write_user_cred_file(env, first_db_id, first_db_name, user_name,
+                                             password, role_label, extra_db_ids=extra_db_ids,
+                                             roles=roles)
+            print(f"  {user_name} (new) roles=[{roles_str}] -> {filepath.name}")
+        else:
+            print(f"  {user_name} (existing) roles added: {roles_str}")
+        query.run_many("system", grant_stmts)
+
+    print(f"\n=== Users ===")
+    for username in usernames:
+        if is_multi:
+            ro_user = f"{username}_ro"
+            rw_user = f"{username}_rw"
+        else:
+            db_slug = _slugify(first_db_name) if first_db_name != first_db_id else first_db_id
+            ro_user = f"{username}_{db_slug}_ro"
+            rw_user = f"{username}_{db_slug}_rw"
+
+        if want_ro:
+            ro_roles = [f"{db_id}_ro" for db_id, _ in db_pairs]
+            _create_or_grant(ro_user, "readonly", ro_roles,
+                [f"GRANT ROLE `{r}` TO `{ro_user}`" for r in ro_roles])
+
+        if want_rw:
+            rw_roles = [r for db_id, _ in db_pairs for r in (f"{db_id}_ro", f"{db_id}_rw")]
+            _create_or_grant(rw_user, "readwrite", rw_roles,
+                [f"GRANT ROLE `{r}` TO `{rw_user}`" for r in rw_roles])
 
 
 def cmd_upload(env: dict):

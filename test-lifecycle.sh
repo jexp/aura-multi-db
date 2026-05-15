@@ -13,9 +13,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PY="${SCRIPT_DIR}/aura-multi-db.py"
 DUMP_FILE="${1:-${SCRIPT_DIR}/test.dump}"
-TEST_DB="test_$(date +%s)"
+TEST_DB="testdb_$(date +%s)"       # slugified name for the database
+INSTANCE_ID="$(grep AURA_INSTANCEID "${SCRIPT_DIR}/.env" | cut -d= -f2 | tr -d '\"'"' '")"
 
-# Colors for output
+# Colors
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 BLUE='\033[0;34m'
@@ -25,7 +26,6 @@ pass() { echo -e "${GREEN}✓ $1${NC}"; }
 fail() { echo -e "${RED}✗ $1${NC}"; exit 1; }
 step() { echo -e "\n${BLUE}=== $1 ===${NC}"; }
 
-# Track database ID (create-db returns a generated ID)
 DB_ID=""
 
 cleanup() {
@@ -43,29 +43,89 @@ step "1. List databases (before)"
 python3 "$PY" list-dbs --yes || fail "list-dbs failed"
 pass "list-dbs"
 
-step "2. Create database '${TEST_DB}' (with users)"
-OUTPUT=$(python3 "$PY" add-db "$TEST_DB" --users --yes 2>&1)
+step "2. Create database '${TEST_DB}' with default users"
+OUTPUT=$(python3 "$PY" add-db "$TEST_DB" --users --wait --yes 2>&1)
 echo "$OUTPUT"
 DB_ID=$(echo "$OUTPUT" | grep "Database ID:" | awk '{print $NF}')
 [ -n "$DB_ID" ] || fail "could not extract database ID"
-pass "add-db --users (database ID: ${DB_ID})"
+pass "add-db --users --wait (database ID: ${DB_ID})"
 
-# Verify credential files were written
-RO_FILE="${SCRIPT_DIR}/Neo4j-$(grep AURA_INSTANCEID "${SCRIPT_DIR}/.env" | cut -d= -f2 | tr -d '\"'"'"'  ')-${DB_ID}-${TEST_DB}-readonly.txt"
+# Credential file: Neo4j-{instance_id}-{db_id}-{db_slug}_ro-readonly.txt
+RO_FILE="${SCRIPT_DIR}/Neo4j-${INSTANCE_ID}-${DB_ID}-${TEST_DB}_ro-readonly.txt"
 [ -f "$RO_FILE" ] || fail "readonly credential file not found: ${RO_FILE}"
 pass "credential files saved"
 
-step "3. List databases (after create)"
+# Pick a second running database for multi-db tests (before launching parallel jobs)
+SECOND_DB=$(python3 "$PY" list-dbs --yes 2>/dev/null \
+    | grep "running" | grep -v "$DB_ID" | awk '{print $1}' | head -1)
+
+step "3+4+4b. Add users (running in parallel)"
+
+# Job A: ro-only named users on the new database
+(
+    python3 "$PY" add-users "$DB_ID" "$TEST_DB" --users testuser1,testuser2 --ro --yes \
+        2>&1 | sed 's/^/  [job-A] /'
+) &
+JOB_A=$!
+
+# Job B: ro+rw named user on the new database
+(
+    python3 "$PY" add-users "$DB_ID" "$TEST_DB" --users testwriter --yes \
+        2>&1 | sed 's/^/  [job-B] /'
+) &
+JOB_B=$!
+
+# Job C: multi-db user across new database + an existing one
+if [ -n "$SECOND_DB" ]; then
+    (
+        python3 "$PY" add-users "${DB_ID},${SECOND_DB}" "${TEST_DB},existing" \
+            --users multiuser --yes 2>&1 | sed 's/^/  [job-C] /'
+    ) &
+    JOB_C=$!
+fi
+
+wait $JOB_A || fail "add-users ro-only (testuser1, testuser2) failed"
+pass "add-users --ro (testuser1, testuser2)"
+
+wait $JOB_B || fail "add-users ro+rw (testwriter) failed"
+pass "add-users (testwriter ro+rw)"
+
+if [ -n "$SECOND_DB" ]; then
+    wait $JOB_C || fail "add-users multi-db failed"
+    pass "add-users multi-db (multiuser ro+rw, home=${DB_ID}, also ${SECOND_DB})"
+fi
+
+# Check credential files were created
+RO_NAMED="${SCRIPT_DIR}/Neo4j-${INSTANCE_ID}-${DB_ID}-testuser1_${TEST_DB}_ro-readonly.txt"
+[ -f "$RO_NAMED" ] || fail "named user credential file not found: ${RO_NAMED}"
+RW_NAMED="${SCRIPT_DIR}/Neo4j-${INSTANCE_ID}-${DB_ID}-testwriter_${TEST_DB}_rw-readwrite.txt"
+[ -f "$RW_NAMED" ] || fail "named rw user credential file not found: ${RW_NAMED}"
+pass "credential files present"
+
+if [ -n "$SECOND_DB" ]; then
+    MULTI_RO="${SCRIPT_DIR}/Neo4j-${INSTANCE_ID}-${DB_ID}-multiuser_ro-readonly.txt"
+    [ -f "$MULTI_RO" ] || fail "multi-db ro credential file not found: ${MULTI_RO}"
+    grep -q "Roles:" "$MULTI_RO"      || fail "credential file missing Roles: comment"
+    grep -q "$SECOND_DB" "$MULTI_RO"  || fail "credential file missing additional database reference"
+    pass "multi-db credential file contains role names and second database"
+
+    step "4b. Multi-db idempotency (user already exists — only roles granted)"
+    python3 "$PY" add-users "${DB_ID},${SECOND_DB}" "${TEST_DB},existing" \
+        --users multiuser --ro --yes \
+        || fail "add-users multi-db idempotency failed"
+    pass "multi-db add-users is idempotent (existing user)"
+fi
+
+step "5. List databases (after create)"
 python3 "$PY" list-dbs --yes || fail "list-dbs failed"
 pass "list-dbs shows new database"
 
 if [ -f "$DUMP_FILE" ]; then
-    step "4. Upload '${DUMP_FILE}' to '${DB_ID}'"
+    step "6. Upload '${DUMP_FILE}' to '${DB_ID}'"
     python3 "$PY" upload "$DB_ID" "$DUMP_FILE" --yes || fail "upload failed"
-    pass "upload + verification query"
+    pass "upload"
 
-    step "5. Query as read-only user"
-    # Read credentials from the generated file
+    step "7. Query as default read-only user"
     RO_USER=$(grep NEO4J_USERNAME "$RO_FILE" | cut -d= -f2)
     RO_PASS=$(grep NEO4J_PASSWORD "$RO_FILE" | cut -d= -f2)
     RO_URI=$(grep NEO4J_URI "$RO_FILE" | cut -d= -f2)
@@ -80,19 +140,19 @@ query.run_and_print('${DB_ID}', 'MATCH (n) RETURN labels(n)[0] AS label, count(*
 " || fail "read-only query failed"
     pass "read-only user can query data"
 else
-    step "4-5. Upload + query (skipped — dump file not found: ${DUMP_FILE})"
+    step "6-7. Upload + query (skipped — dump file not found: ${DUMP_FILE})"
 fi
 
-step "6. Delete database '${DB_ID}' (also removes users/roles)"
+step "8. Delete database '${DB_ID}' (removes roles; named users remain)"
 python3 "$PY" delete-db "$DB_ID" --wait --yes || fail "delete-db failed"
 DB_ID=""  # prevent double-cleanup
 pass "delete-db --wait"
 
-step "7. List databases (after delete)"
+step "9. List databases (after delete)"
 python3 "$PY" list-dbs --yes || fail "list-dbs failed"
 pass "list-dbs confirms deletion"
 
 # Clean up credential files
-rm -f "${SCRIPT_DIR}"/Neo4j-*-"${TEST_DB}"-*.txt 2>/dev/null || true
+rm -f "${SCRIPT_DIR}"/Neo4j-*-"${DB_ID}"-*.txt 2>/dev/null || true
 
 echo -e "\n${GREEN}=== All tests passed ===${NC}"
