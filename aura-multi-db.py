@@ -258,7 +258,9 @@ class AuraAPI:
         url = f"{AURA_API_BASE}{path}"
         headers = {"Authorization": f"Bearer {self._get_token()}"}
         result = _json_request(url, method=method, headers=headers, body=body)
-        if "error" in result or "errors" in result:
+        # Check both lowercase keys (standard) and capitalized keys (403 gateway responses)
+        if ("error" in result or "errors" in result
+                or "Message" in result or "Reason" in result):
             die(json.dumps(result, indent=2))
         return result
 
